@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+
+from collections import namedtuple
+from datetime import datetime
+import argparse
+import simplekml
+import sqlite3
+import glob
+import re
+import xmltodict
+import logging
+import json
+import fnmatch
+import sys
+import csv
+
+
+"""
+
+    DISCLAMER: parts of this program has been taken from Securitybits-io and the taky project
+
+"""
+
+
+def tokenizeCOT(cotname):
+    cots = {}
+    cot = ""
+    with open(cotname, "r") as f:
+        cot = f.read()
+    # TODO catch exception for malformed events
+    for start in range(0, len(cot)):
+        if cot[start : start + 6] == "<event":
+            for end in range(start, len(cot)):
+                if cot[end : end + 8] == "</event>":
+                    pcot = parse_cot(cot[start : end + 8])
+                    if pcot != None:
+                        ts = pcot["time"]
+                        cots[ts] = pcot
+                    break
+    return cots
+
+
+def parse_cot(rawcot):
+    """
+    Apperently Itak will send "a-f-G-U-C" and Atak "a-f-G-E-V-C" cots. 
+    """
+
+    dict_cot = xmltodict.parse(rawcot)
+    logging.debug(dict_cot)
+    cot = None
+    
+    if "a-f-G-E-V-C" in dict_cot["event"]["@type"] or "a-f-G-U-C" in dict_cot["event"]["@type"]:
+        detail = dict_cot["event"]["detail"]
+
+        time = dict_cot["event"]["@time"]
+        callsign = detail["contact"]["@callsign"]
+        color = detail["__group"]["@name"]
+        role = detail["__group"]["@role"]
+        coords = dict_cot["event"]["point"]
+
+        utc_time = time.replace("Z", "UTC")
+        utc_dt = datetime.strptime(utc_time, "%Y-%m-%dT%H:%M:%S.%f%Z")
+        # YYYY-MM-DD hh:mm:ss
+        cot = {
+            "time": time.strip("Z"),
+            "callsign": callsign,
+            "tak_color": color,
+            "tak_role": role,
+            "lat": coords["@lat"],
+            "lon": coords["@lon"],
+        }
+
+        log = "{} | {} | {} | {} | {} | {}".format(
+            time, callsign, color, role, coords["@lat"], coords["@lon"]
+        )
+        logging.debug("Formatted CoT: %s", log)
+    return cot
+
+
+def genkml(fname, res):
+    fname = fname + ".kml"
+    callid = getcallid(fname)
+    idletter = callid.upper()[0]
+    kml = simplekml.Kml()
+    elem = sorted(res.keys())
+    start = elem[0]
+    for i in elem:
+        e = res[i]
+        print(e)
+        p = kml.newpoint(name=e["callsign"], coords=[(e["lon"], e["lat"])])
+        p.timespan.begin = start
+        p.timespan.end = i
+        if callid == "TEST":
+            p.style.iconstyle.icon.href = (
+                f"http://maps.google.com/mapfiles/kml/shapes/woman.png"
+            )
+        else:
+            p.style.iconstyle.icon.href = (
+                f"http://maps.google.com/mapfiles/kml/paddle/{idletter}.png"
+            )
+
+        start = i
+    kml.save(fname)
+
+
+def genkmlendpoint(ntup):
+    kml = simplekml.Kml()
+
+    for i in ntup:
+        p = kml.newpoint(name=i.Callsign, coords=[(i.Lon, i.Lat)])
+        idletter = i.Callsign.upper()[0]
+        p.style.iconstyle.icon.href = (
+            f"http://maps.google.com/mapfiles/kml/paddle/{idletter}.png"
+        )
+
+    now = datetime.now().isoformat()
+    print(f"[+] Writing file to endpoint-{now}.kml")
+    kml.save(f"endpoint-{now}.kml")
+
+
+def gen_csv_endpoint(ntup):
+    now = datetime.now().isoformat()
+    print(f"[+] Writing file to endpoint-{now}.csv")
+    with open(f"endpoint-{now}.csv", "w") as cf:
+        cw = csv.writer(cf)
+        cw.writerow(ntup[0]._fields)
+        cw.writerows(ntup)
+
+
+def getcallid(fname):
+    # yes I know regex FTW TODO
+    fname = fname.rsplit("-")[-1].split(".")[0]
+    # properly should do more sanitation but since is it already written on disk
+    fname = fname.replace(".", "").replace("/", "")
+    return fname
+
+
+def number_of_files(dirpath, pattern):
+    return len(fnmatch.filter(os.listdir(dirpath), pattern))
+
+
+def process_files(path):
+    res = []
+    for i in glob.glob(path + "/*.cot"):
+        dcots = tokenizeCOT(i)
+        res.append(dcots)
+    return res
+    # genkml(i, tf)
+
+
+def timeline(path):
+    for i in glob.glob(path + "/*.cot"):
+        print(i)
+        dcots = tokenizeCOT(i)
+        genkml(i, dcots)
+
+
+def overview(path):
+    res = []
+    row = namedtuple("row", ["Callsign", "Records", "Start", "End", "Lat", "Lon"])
+    for i in glob.glob(path + "/*.cot"):
+        callid = getcallid(i)
+        tf = tokenizeCOT(i)
+        ts = sorted(tf.keys())
+        # todo check size
+        start = ts[0]
+        end = ts[-1]
+        lastrecord = ts[-1]
+        lastrecord = tf[lastrecord]
+        res.append(
+            row(
+                Callsign=callid,
+                Records=len(ts),
+                Start=start,
+                End=end,
+                Lat=lastrecord["lat"],
+                Lon=lastrecord["lon"],
+            )
+        )
+    return res
+
+
+def isotounix(st):
+    utc_dt = datetime.strptime(st, "%Y-%m-%dT%H:%M:%S.%f")
+    timestamp = (utc_dt - datetime(1970, 1, 1)).total_seconds()
+    return timestamp
+
+
+def nttojson(lntuples):
+    pass
+
+
+def alltojson(cots):
+    return json.dumps(cots)
+
+
+def alltodb(path):
+    createdb = "CREATE TABLE IF NOT EXISTS cots (time DATETIME NOT NULL PRIMARY KEY, callsign VARCHAR(24), cot_group VARCHAR(10), role VARCHAR(16), lat DOUBLE, lon DOUBLE);"
+    insert = "INSERT OR IGNORE INTO `cots` (`time`, `callsign`, `cot_group`, `role`, `lat`, `lon`) VALUES (?, ?, ?, ?, ?, ?)"
+    conn = sqlite3.connect("cots.sqlite")
+    cur = conn.cursor()
+    conn.set_trace_callback(print)
+    cur.execute(createdb)
+    for i in glob.glob(path + "/*.cot"):
+        callid = getcallid(i)
+        tf = tokenizeCOT(i)
+        ts = sorted(tf.keys())
+        # todo check size
+        for j in ts:
+            print(tf[j])
+            print(
+                (
+                    isotounix(j),
+                    callid,
+                    "Null",
+                    "NULL",
+                    tf[j]["lat"],
+                    tf[j]["lon"],
+                )
+            )
+            val = (
+                isotounix(j),
+                callid,
+                "Null",
+                "NULL",
+                tf[j]["lat"],
+                tf[j]["lon"],
+            )
+            cur.execute(insert, val)
+            conn.commit()
+
+
+def pprinttable(rows):
+    """
+    Pretty Print a table of collections.namedtuples
+
+    Kudos to @MattH on Stack Overflow
+
+    @args rows A list of named tuples
+    """
+    headers = rows[0]._fields
+    lens = []
+    for i in range(len(rows[0])):
+        lens.append(
+            len(max([x[i] for x in rows] + [headers[i]], key=lambda x: len(str(x))))
+        )
+
+    formats = []
+    hformats = []
+    for i in range(len(rows[0])):
+        if isinstance(rows[0][i], (int, float)):
+            formats.append("%%%dd" % lens[i])
+        else:
+            formats.append("%%-%ds" % lens[i])
+        hformats.append("%%-%ds" % lens[i])
+
+    pattern = " | ".join(formats)
+    hpattern = " | ".join(hformats)
+    separator = "-+-".join(["-" * n for n in lens])
+
+    print(hpattern % tuple(headers))
+    print(separator)
+    for line in rows:
+        print(pattern % tuple(t for t in line))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        usage="""takylog <command> [options]
+        taky-log is a tool to analyze taky cot logs. In order to use this tool you will have to make taky store logs files.
+        This is done by setting the 'log_cot= <PATH>' in the taky.conf.
+        taky-log has two commands.
+
+        all:        will analyze all the cot files in a given path
+        summary:    will only give an overall set of data
+
+        Create a kml endpoint run  
+        # taky-log summary --path [path-cotfiles] --type kml 
+        """
+    )
+
+    subparsers = parser.add_subparsers(title="commands", dest="command")
+
+    summaryparser = subparsers.add_parser("summary", help="Summary command")
+    summaryparser.add_argument("--path", required=True)
+    summaryparser.add_argument(
+        "--type", required=True, choices=["kml", "stdout", "csv"]
+    )
+
+    allparser = subparsers.add_parser("all", help="Process all command")
+    allparser.add_argument("--path", required=True)
+    allparser.add_argument("--type", required=True, choices=["kml", "json", "sqlite"])
+
+    args = parser.parse_args()
+    if args.command == "summary":
+        parser_sum(args)
+    elif args.command == "all":
+        parser_all(args)
+
+
+def parser_sum(args):
+    info = overview(args.path)
+    if len(info) == 0:
+        sys.exit("No COT info check file path")
+    if args.type == "stdout":
+        pprinttable(info)
+    if args.type == "kml":
+        genkmlendpoint(info)
+    if args.type == "csv":
+        gen_csv_endpoint(info)
+
+
+def parser_all(args):
+    if args.type == "json":
+        info = process_files(args.path)
+        print(alltojson(info))
+    if args.type == "kml":
+        timeline(args.path)
+    if args.type == "sqlite":
+        alltodb(args.path)
+
+
+if __name__ == "__main__":
+    main()
